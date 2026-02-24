@@ -1,0 +1,11 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    @apply text-[rgba(255,255,255,0.87)] bg-[#0f0f0f] font-sans;
+  }
+
+  body {
+    @apply min-w-[320px] min-h-screen m-0;
+  }
+}
