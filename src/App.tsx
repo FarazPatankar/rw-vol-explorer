@@ -19,6 +19,241 @@ function formatDate(iso: string): string {
   return new Date(iso).toLocaleString();
 }
 
+interface PgStatus {
+  connected: boolean;
+  version?: string;
+  database?: string;
+  user?: string;
+  error?: string;
+}
+
+interface PgTable {
+  name: string;
+  row_count: number;
+}
+
+interface QueryResult {
+  columns: string[];
+  rows: Record<string, any>[];
+  rowCount: number;
+  duration: number;
+}
+
+function PostgresExplorer() {
+  const [status, setStatus] = useState<PgStatus | null>(null);
+  const [tables, setTables] = useState<PgTable[]>([]);
+  const [query, setQuery] = useState("");
+  const [result, setResult] = useState<QueryResult | null>(null);
+  const [queryError, setQueryError] = useState<string | null>(null);
+  const [running, setRunning] = useState(false);
+
+  const fetchStatus = useCallback(async () => {
+    try {
+      const res = await fetch("/api/pg/status");
+      setStatus(await res.json());
+    } catch {
+      setStatus({ connected: false, error: "Failed to reach server" });
+    }
+  }, []);
+
+  const fetchTables = useCallback(async () => {
+    try {
+      const res = await fetch("/api/pg/tables");
+      const data = await res.json();
+      if (data.tables) setTables(data.tables);
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    fetchStatus();
+  }, [fetchStatus]);
+
+  useEffect(() => {
+    if (status?.connected) fetchTables();
+  }, [status?.connected, fetchTables]);
+
+  const runQuery = async (sql: string) => {
+    setRunning(true);
+    setQueryError(null);
+    setResult(null);
+    try {
+      const res = await fetch("/api/pg/query", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: sql }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        setQueryError(data.error);
+      } else {
+        setResult(data);
+      }
+    } catch (e: any) {
+      setQueryError(e.message);
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  const handleSubmit = () => {
+    if (query.trim()) runQuery(query);
+  };
+
+  const handleTableClick = (tableName: string) => {
+    const sql = `SELECT * FROM "${tableName}" LIMIT 100`;
+    setQuery(sql);
+    runQuery(sql);
+  };
+
+  if (status && !status.connected) {
+    return (
+      <div>
+        <h1 className="text-2xl font-bold mb-4">Postgres Explorer</h1>
+        <div className="p-4 bg-zinc-800 rounded-lg border border-zinc-700 text-zinc-400 text-sm">
+          <div className="flex items-center gap-2 mb-1">
+            <span className="w-2.5 h-2.5 rounded-full bg-red-500 inline-block" />
+            <span className="font-medium text-zinc-300">Not Connected</span>
+          </div>
+          <p>{status.error || "DATABASE_URL is not configured."}</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <h1 className="text-2xl font-bold mb-4">Postgres Explorer</h1>
+
+      {/* Connection status */}
+      {status && (
+        <div className="mb-4 p-3 bg-zinc-800 rounded-lg border border-zinc-700 text-sm flex items-center gap-3">
+          <span className="w-2.5 h-2.5 rounded-full bg-green-500 inline-block flex-shrink-0" />
+          <div className="text-zinc-300 min-w-0">
+            <span className="font-medium text-white">{status.database}</span>
+            <span className="text-zinc-500 mx-1.5">|</span>
+            <span>{status.user}</span>
+            <span className="text-zinc-500 mx-1.5">|</span>
+            <span className="text-zinc-400 truncate">{status.version?.split(",")[0]}</span>
+          </div>
+        </div>
+      )}
+
+      {/* Tables list */}
+      {tables.length > 0 && (
+        <div className="mb-4">
+          <h3 className="text-sm font-medium text-zinc-400 mb-2">Tables</h3>
+          <div className="flex flex-wrap gap-2">
+            {tables.map((t) => (
+              <button
+                key={t.name}
+                onClick={() => handleTableClick(t.name)}
+                className="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded text-sm transition-colors"
+              >
+                {t.name}
+                <span className="text-zinc-500 ml-1.5">({t.row_count})</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Quick queries */}
+      <div className="mb-4">
+        <h3 className="text-sm font-medium text-zinc-400 mb-2">Quick Queries</h3>
+        <div className="flex flex-wrap gap-2">
+          {[
+            { label: "Test Connection", sql: "SELECT 1 AS ok" },
+            { label: "Trigger Error", sql: "SELECT * FROM this_table_does_not_exist" },
+            { label: "List Tables", sql: "SELECT tablename FROM pg_tables WHERE schemaname = 'public'" },
+          ].map((q) => (
+            <button
+              key={q.label}
+              onClick={() => { setQuery(q.sql); runQuery(q.sql); }}
+              className="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded text-sm transition-colors"
+            >
+              {q.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Query editor */}
+      <div className="mb-4">
+        <textarea
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => {
+            if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+              e.preventDefault();
+              handleSubmit();
+            }
+          }}
+          placeholder="SELECT * FROM ..."
+          className="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded text-sm font-mono outline-none focus:border-blue-500 h-28 resize-y"
+        />
+        <div className="flex items-center gap-2 mt-2">
+          <button
+            onClick={handleSubmit}
+            disabled={running || !query.trim()}
+            className="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-zinc-700 disabled:text-zinc-500 rounded text-sm transition-colors"
+          >
+            {running ? "Running..." : "Run Query"}
+          </button>
+          <span className="text-xs text-zinc-500">Cmd+Enter to run</span>
+        </div>
+      </div>
+
+      {/* Query error */}
+      {queryError && (
+        <div className="mb-4 p-3 bg-red-900/30 border border-red-800 rounded text-red-300 text-sm font-mono whitespace-pre-wrap">
+          {queryError}
+        </div>
+      )}
+
+      {/* Results table */}
+      {result && (
+        <div>
+          <div className="text-xs text-zinc-500 mb-2">
+            {result.rowCount} row{result.rowCount !== 1 ? "s" : ""} in {result.duration}ms
+          </div>
+          {result.columns.length > 0 ? (
+            <div className="border border-zinc-800 rounded-lg overflow-auto max-h-[60vh]">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="bg-zinc-800/50 text-zinc-400 text-left sticky top-0">
+                    {result.columns.map((col) => (
+                      <th key={col} className="px-4 py-2 font-medium whitespace-nowrap">
+                        {col}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {result.rows.map((row, i) => (
+                    <tr key={i} className="border-t border-zinc-800 hover:bg-zinc-800/30">
+                      {result.columns.map((col) => (
+                        <td key={col} className="px-4 py-2 text-zinc-300 whitespace-nowrap max-w-xs truncate">
+                          {row[col] === null ? (
+                            <span className="text-zinc-600 italic">null</span>
+                          ) : (
+                            String(row[col])
+                          )}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="text-sm text-zinc-400">Query executed successfully (no rows returned).</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function App() {
   const [currentPath, setCurrentPath] = useState("/");
   const [items, setItems] = useState<FileEntry[]>([]);
@@ -362,6 +597,11 @@ export function App() {
           </table>
         </div>
       )}
+
+      {/* Postgres Explorer */}
+      <div className="mt-10 pt-8 border-t border-zinc-800">
+        <PostgresExplorer />
+      </div>
 
       {/* Preview modal */}
       {preview && (

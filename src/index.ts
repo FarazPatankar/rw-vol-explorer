@@ -3,6 +3,10 @@ import { readdir, stat, mkdir, rm, exists } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import index from "./index.html";
 
+// Postgres setup — only connects if DATABASE_URL is set
+const hasPg = !!process.env.DATABASE_URL;
+const sql = hasPg ? Bun.sql : null;
+
 const VOLUME_ROOT = resolve(process.env.VOLUME_PATH || (process.env.NODE_ENV === "production" ? "/data" : "./data"));
 
 function safePath(requestedPath: string): string {
@@ -154,6 +158,74 @@ const server = serve({
           }
           const text = await file.text();
           return Response.json({ content: text, size: stats.size });
+        } catch (e: any) {
+          return Response.json({ error: e.message }, { status: 400 });
+        }
+      },
+    },
+
+    "/api/pg/status": {
+      async GET() {
+        if (!sql) {
+          return Response.json({ connected: false, error: "DATABASE_URL not configured" });
+        }
+        try {
+          const [row] = await sql`SELECT version(), current_database(), current_user`;
+          return Response.json({
+            connected: true,
+            version: row.version,
+            database: row.current_database,
+            user: row.current_user,
+          });
+        } catch (e: any) {
+          return Response.json({ connected: false, error: e.message });
+        }
+      },
+    },
+
+    "/api/pg/tables": {
+      async GET() {
+        if (!sql) {
+          return Response.json({ error: "DATABASE_URL not configured" }, { status: 503 });
+        }
+        try {
+          const tables = await sql`
+            SELECT t.tablename AS name,
+                   COALESCE(s.n_live_tup, 0) AS row_count
+            FROM pg_catalog.pg_tables t
+            LEFT JOIN pg_stat_user_tables s
+              ON s.relname = t.tablename AND s.schemaname = t.schemaname
+            WHERE t.schemaname = 'public'
+            ORDER BY t.tablename
+          `;
+          return Response.json({ tables });
+        } catch (e: any) {
+          return Response.json({ error: e.message }, { status: 500 });
+        }
+      },
+    },
+
+    "/api/pg/query": {
+      async POST(req) {
+        if (!sql) {
+          return Response.json({ error: "DATABASE_URL not configured" }, { status: 503 });
+        }
+        const body = await req.json();
+        const query = body.query?.trim();
+        if (!query) {
+          return Response.json({ error: "query is required" }, { status: 400 });
+        }
+        try {
+          const start = performance.now();
+          const rows = await sql.unsafe(query);
+          const duration = Math.round(performance.now() - start);
+          const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
+          return Response.json({
+            columns,
+            rows,
+            rowCount: rows.length,
+            duration,
+          });
         } catch (e: any) {
           return Response.json({ error: e.message }, { status: 400 });
         }
