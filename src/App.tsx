@@ -1,5 +1,5 @@
 import "./index.css";
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 interface FileEntry {
   name: string;
@@ -286,6 +286,14 @@ export function App() {
     fetchFiles("/");
   }, [fetchFiles]);
 
+  // Calculate total size of all files in current directory
+  const totalSize = useMemo(() => {
+    return items.reduce((sum, item) => {
+      // Only count files, not directories
+      return sum + (item.isDirectory ? 0 : item.size);
+    }, 0);
+  }, [items]);
+
   const navigate = (name: string) => {
     const next = currentPath === "/" ? `/${name}` : `${currentPath}/${name}`;
     fetchFiles(next);
@@ -415,6 +423,14 @@ export function App() {
             </button>
           </span>
         ))}
+      </div>
+
+      {/* Total Size Summary */}
+      <div className="mb-4 p-3 bg-zinc-800 rounded-lg border border-zinc-700">
+        <div className="flex items-center justify-between text-sm">
+          <span className="text-zinc-400">Total Size (Current Directory):</span>
+          <span className="font-medium text-white">{formatSize(totalSize)}</span>
+        </div>
       </div>
 
       {/* Actions */}
