@@ -19,6 +19,16 @@ function formatDate(iso: string): string {
   return new Date(iso).toLocaleString();
 }
 
+function formatUptime(seconds: number): string {
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+
 interface PgStatus {
   connected: boolean;
   version?: string;
@@ -36,6 +46,22 @@ interface QueryResult {
   columns: string[];
   rows: Record<string, any>[];
   rowCount: number;
+  duration: number;
+}
+
+interface RedisStatus {
+  connected: boolean;
+  version?: string;
+  mode?: string;
+  uptime?: number;
+  dbsize?: number;
+  host?: string;
+  port?: number;
+  error?: string;
+}
+
+interface RedisCommandResult {
+  result: any;
   duration: number;
 }
 
@@ -248,6 +274,173 @@ function PostgresExplorer() {
           ) : (
             <div className="text-sm text-zinc-400">Query executed successfully (no rows returned).</div>
           )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RedisExplorer() {
+  const [status, setStatus] = useState<RedisStatus | null>(null);
+  const [command, setCommand] = useState("");
+  const [result, setResult] = useState<RedisCommandResult | null>(null);
+  const [commandError, setCommandError] = useState<string | null>(null);
+  const [running, setRunning] = useState(false);
+
+  const fetchStatus = useCallback(async () => {
+    try {
+      const res = await fetch("/api/redis/status");
+      setStatus(await res.json());
+    } catch {
+      setStatus({ connected: false, error: "Failed to reach server" });
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchStatus();
+  }, [fetchStatus]);
+
+  const runCommand = async (cmd: string) => {
+    setRunning(true);
+    setCommandError(null);
+    setResult(null);
+    try {
+      // Parse command string into array
+      const parts = cmd.trim().split(/\s+/);
+      
+      const res = await fetch("/api/redis/command", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ command: parts }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        setCommandError(data.error);
+      } else {
+        setResult(data);
+      }
+    } catch (e: any) {
+      setCommandError(e.message);
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  const handleSubmit = () => {
+    if (command.trim()) runCommand(command);
+  };
+
+  const formatResult = (res: any): string => {
+    if (res === null) return "(nil)";
+    if (Array.isArray(res)) {
+      return res.map((item, i) => `${i + 1}) ${formatResult(item)}`).join("\n");
+    }
+    return String(res);
+  };
+
+  if (status && !status.connected) {
+    return (
+      <div>
+        <h1 className="text-2xl font-bold mb-4">Redis Explorer</h1>
+        <div className="p-4 bg-zinc-800 rounded-lg border border-zinc-700 text-zinc-400 text-sm">
+          <div className="flex items-center gap-2 mb-1">
+            <span className="w-2.5 h-2.5 rounded-full bg-red-500 inline-block" />
+            <span className="font-medium text-zinc-300">Not Connected</span>
+          </div>
+          <p>{status.error || "REDIS_URL is not configured."}</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <h1 className="text-2xl font-bold mb-4">Redis Explorer</h1>
+
+      {/* Connection status */}
+      {status && (
+        <div className="mb-4 p-3 bg-zinc-800 rounded-lg border border-zinc-700 text-sm flex items-center gap-3">
+          <span className="w-2.5 h-2.5 rounded-full bg-green-500 inline-block flex-shrink-0" />
+          <div className="text-zinc-300 min-w-0">
+            <span className="font-medium text-white">{status.host}:{status.port}</span>
+            <span className="text-zinc-500 mx-1.5">|</span>
+            <span>Redis {status.version}</span>
+            <span className="text-zinc-500 mx-1.5">|</span>
+            <span className="text-zinc-400">{status.mode}</span>
+            <span className="text-zinc-500 mx-1.5">|</span>
+            <span className="text-zinc-400">Keys: {status.dbsize}</span>
+            <span className="text-zinc-500 mx-1.5">|</span>
+            <span className="text-zinc-400">Uptime: {formatUptime(status.uptime || 0)}</span>
+          </div>
+        </div>
+      )}
+
+      {/* Quick commands */}
+      <div className="mb-4">
+        <h3 className="text-sm font-medium text-zinc-400 mb-2">Quick Commands</h3>
+        <div className="flex flex-wrap gap-2">
+          {[
+            { label: "PING", cmd: "PING" },
+            { label: "INFO", cmd: "INFO" },
+            { label: "DBSIZE", cmd: "DBSIZE" },
+            { label: "KEYS *", cmd: "KEYS *" },
+          ].map((q) => (
+            <button
+              key={q.label}
+              onClick={() => { setCommand(q.cmd); runCommand(q.cmd); }}
+              className="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded text-sm transition-colors"
+            >
+              {q.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Command input */}
+      <div className="mb-4">
+        <input
+          type="text"
+          value={command}
+          onChange={(e) => setCommand(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              handleSubmit();
+            }
+          }}
+          placeholder="PING, GET key, SET key value, etc."
+          className="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded text-sm font-mono outline-none focus:border-blue-500"
+        />
+        <div className="flex items-center gap-2 mt-2">
+          <button
+            onClick={handleSubmit}
+            disabled={running || !command.trim()}
+            className="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-zinc-700 disabled:text-zinc-500 rounded text-sm transition-colors"
+          >
+            {running ? "Running..." : "Run Command"}
+          </button>
+          <span className="text-xs text-zinc-500">Enter to run</span>
+        </div>
+      </div>
+
+      {/* Command error */}
+      {commandError && (
+        <div className="mb-4 p-3 bg-red-900/30 border border-red-800 rounded text-red-300 text-sm font-mono whitespace-pre-wrap">
+          {commandError}
+        </div>
+      )}
+
+      {/* Results */}
+      {result && (
+        <div>
+          <div className="text-xs text-zinc-500 mb-2">
+            Executed in {result.duration}ms
+          </div>
+          <div className="p-4 bg-zinc-900 border border-zinc-800 rounded-lg">
+            <pre className="text-sm font-mono text-zinc-300 whitespace-pre-wrap">
+              {formatResult(result.result)}
+            </pre>
+          </div>
         </div>
       )}
     </div>
@@ -601,6 +794,11 @@ export function App() {
       {/* Postgres Explorer */}
       <div className="mt-10 pt-8 border-t border-zinc-800">
         <PostgresExplorer />
+      </div>
+
+      {/* Redis Explorer */}
+      <div className="mt-10 pt-8 border-t border-zinc-800">
+        <RedisExplorer />
       </div>
 
       {/* Preview modal */}
