@@ -7,6 +7,144 @@ import index from "./index.html";
 const hasPg = !!process.env.DATABASE_URL;
 const sql = hasPg ? Bun.sql : null;
 
+// Redis setup — only connects if REDIS_URL is set
+const hasRedis = !!process.env.REDIS_URL;
+let redisClient: any = null;
+
+// Simple Redis client using TCP socket
+async function createRedisClient(url: string) {
+  const parsedUrl = new URL(url);
+  const host = parsedUrl.hostname;
+  const port = parseInt(parsedUrl.port || "6379");
+  const password = parsedUrl.password || null;
+  
+  return {
+    host,
+    port,
+    password,
+    async connect() {
+      const socket = await Bun.connect({
+        hostname: host,
+        port: port,
+        socket: {
+          data(socket, data) {},
+          open(socket) {},
+          close(socket) {},
+          drain(socket) {},
+          error(socket, error) {},
+        },
+      });
+      return socket;
+    },
+    async sendCommand(command: string[]): Promise<any> {
+      const socket = await this.connect();
+      
+      // Build RESP protocol message
+      let resp = `*${command.length}\r\n`;
+      for (const arg of command) {
+        resp += `$${arg.length}\r\n${arg}\r\n`;
+      }
+      
+      return new Promise((resolve, reject) => {
+        let buffer = "";
+        
+        socket.data = (sock, data) => {
+          buffer += new TextDecoder().decode(data);
+          
+          // Simple RESP parser for basic responses
+          if (buffer.includes("\r\n")) {
+            const lines = buffer.split("\r\n");
+            const firstChar = lines[0][0];
+            
+            if (firstChar === "+") {
+              // Simple string
+              resolve(lines[0].substring(1));
+              sock.end();
+            } else if (firstChar === "-") {
+              // Error
+              reject(new Error(lines[0].substring(1)));
+              sock.end();
+            } else if (firstChar === ":") {
+              // Integer
+              resolve(parseInt(lines[0].substring(1)));
+              sock.end();
+            } else if (firstChar === "$") {
+              // Bulk string
+              const len = parseInt(lines[0].substring(1));
+              if (len === -1) {
+                resolve(null);
+                sock.end();
+              } else if (lines[1]) {
+                resolve(lines[1]);
+                sock.end();
+              }
+            } else if (firstChar === "*") {
+              // Array - simplified parsing
+              const count = parseInt(lines[0].substring(1));
+              if (count === -1) {
+                resolve(null);
+                sock.end();
+              } else {
+                const result: any[] = [];
+                let idx = 1;
+                for (let i = 0; i < count; i++) {
+                  if (lines[idx] && lines[idx][0] === "$") {
+                    const len = parseInt(lines[idx].substring(1));
+                    if (len >= 0 && lines[idx + 1]) {
+                      result.push(lines[idx + 1]);
+                      idx += 2;
+                    } else {
+                      result.push(null);
+                      idx += 1;
+                    }
+                  } else {
+                    idx++;
+                  }
+                }
+                resolve(result);
+                sock.end();
+              }
+            }
+          }
+        };
+        
+        socket.write(resp);
+        
+        setTimeout(() => {
+          socket.end();
+          reject(new Error("Redis command timeout"));
+        }, 5000);
+      });
+    },
+    async ping() {
+      return await this.sendCommand(["PING"]);
+    },
+    async info(section?: string) {
+      if (section) {
+        return await this.sendCommand(["INFO", section]);
+      }
+      return await this.sendCommand(["INFO"]);
+    },
+    async dbsize() {
+      return await this.sendCommand(["DBSIZE"]);
+    },
+    async get(key: string) {
+      return await this.sendCommand(["GET", key]);
+    },
+    async keys(pattern: string) {
+      return await this.sendCommand(["KEYS", pattern]);
+    },
+  };
+}
+
+if (hasRedis) {
+  try {
+    redisClient = await createRedisClient(process.env.REDIS_URL!);
+  } catch (e) {
+    console.error("Failed to create Redis client:", e);
+  }
+}
+
 const VOLUME_ROOT = resolve(process.env.VOLUME_PATH || (process.env.NODE_ENV === "production" ? "/data" : "./data"));
 
 function safePath(requestedPath: string): string {
@@ -224,6 +362,87 @@ const server = serve({
             columns,
             rows,
             rowCount: rows.length,
+            duration,
+          });
+        } catch (e: any) {
+          return Response.json({ error: e.message }, { status: 400 });
+        }
+      },
+    },
+
+    "/api/redis/status": {
+      async GET() {
+        if (!redisClient) {
+          return Response.json({ connected: false, error: "REDIS_URL not configured" });
+        }
+        try {
+          const pingResult = await redisClient.ping();
+          const info = await redisClient.info("server");
+          const dbsize = await redisClient.dbsize();
+          
+          // Parse info string for version and other details
+          const infoLines = info.split("\r\n");
+          let version = "Unknown";
+          let mode = "standalone";
+          let uptime = 0;
+          
+          for (const line of infoLines) {
+            if (line.startsWith("redis_version:")) {
+              version = line.split(":")[1];
+            } else if (line.startsWith("redis_mode:")) {
+              mode = line.split(":")[1];
+            } else if (line.startsWith("uptime_in_seconds:")) {
+              uptime = parseInt(line.split(":")[1]);
+            }
+          }
+          
+          return Response.json({
+            connected: true,
+            version,
+            mode,
+            uptime,
+            dbsize,
+            host: redisClient.host,
+            port: redisClient.port,
+          });
+        } catch (e: any) {
+          return Response.json({ connected: false, error: e.message });
+        }
+      },
+    },
+
+    "/api/redis/info": {
+      async GET(req) {
+        if (!redisClient) {
+          return Response.json({ error: "REDIS_URL not configured" }, { status: 503 });
+        }
+        const url = new URL(req.url);
+        const section = url.searchParams.get("section") || undefined;
+        try {
+          const info = await redisClient.info(section);
+          return Response.json({ info });
+        } catch (e: any) {
+          return Response.json({ error: e.message }, { status: 500 });
+        }
+      },
+    },
+
+    "/api/redis/command": {
+      async POST(req) {
+        if (!redisClient) {
+          return Response.json({ error: "REDIS_URL not configured" }, { status: 503 });
+        }
+        const body = await req.json();
+        const command = body.command;
+        if (!command || !Array.isArray(command) || command.length === 0) {
+          return Response.json({ error: "command array is required" }, { status: 400 });
+        }
+        try {
+          const start = performance.now();
+          const result = await redisClient.sendCommand(command);
+          const duration = Math.round(performance.now() - start);
+          return Response.json({
+            result,
             duration,
           });
         } catch (e: any) {
